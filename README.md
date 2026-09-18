@@ -1,5 +1,5 @@
 # jieqi_tiantian
-整个项目 YOLO 模型由生成的数据集训练，其它的 UI 和 Readme 都是 DSH 写的
+整个项目 YOLO 模型由生成的数据集训练，其它的 UI 和 Readme 都是 DSH 写的  
 用 YOLO 识别「天天象棋」的揭棋画面，把局面转成皮卡鱼揭棋引擎
 （`pikafish-bmi2.exe`，[Pikafish jieqi 分支](https://github.com/official-pikafish/Pikafish/tree/jieqi)）
 所需的 FEN，实时分析并给出评分、中文着法与棋盘箭头。
