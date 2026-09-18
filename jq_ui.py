@@ -387,8 +387,10 @@ class BoardWidget(QWidget):
                 else:
                     self._draw_fallback(p, pc, x, y, cell)
 
-        # 箭头
-        for item in self.arrows:
+        # 箭头（画在棋子之上，否则会被棋子挡住）
+        # 注意：列表里是 Multipv #1 → #n，绘制时**倒序**画，
+        # 这样最优解的箭头落在最上层，不会被其它候选压住。
+        for item in reversed(self.arrows):
             frm, to, color = item[0], item[1], item[2]
             dashed = item[3] if len(item) > 3 else False
             self._arrow(p, frm, to, cell, ox, oy, color, dashed)

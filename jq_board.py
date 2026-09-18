@@ -456,10 +456,64 @@ def empty_pool():
 
 
 def default_pool_guess(board, captured=None):
-    """由盘面（+棋盘外被吃子）推算暗子池：
-       池[兵种] = 全套数量 - 盘面已翻开 - 棋盘外已确认被吃
-    然后强制让 sum(pool[side]) == 该方暗子个数（不足/超出按“最可能”原则微调）。
+    """由盘面推算暗子池（默认口径，见 pool_from_bounds 的说明）。
+
+    只减「能确认已经不在暗子里的子」：
+      * 盘面上已翻开的明子；
+      * 棋盘外确有实物、且兵种看得清的被吃子（captured）。
+    不确定的一律按最坏情况保留在池里。
+
+    注意：**不要**把被吃子区的低置信度猜测塞进 captured，
+    那等于把对手吃掉什么暗子的隐藏信息凭空"猜"成已知。
     """
+    return pool_from_bounds(board, captured)[0]
+
+
+def pool_from_bounds(board, captured=None, unknown_captured=None):
+    """由盘面 + 已确认的被吃子，算出每方各兵种「至多还可能有多少暗子」。
+
+    返回 (pool, bounds)。pool 是直接可以发给引擎的最坏情况池。
+
+    口径（重要，直接决定引擎评估质量）：
+      bound[k] = 全套数量 - 盘面已翻开的 k - 已确认被吃且看得清兵种的 k
+
+    对「对手吃掉了我方暗子」这种情况：暗子被吃时对方看得见兵种、我方看不见，
+    所以**不能**推断出池里缺哪个兵种，只能确定「总暗子数少了 1」。
+    这个总数差额用 unobserved 的兵种按「先兵、再马炮、再车士象」的顺序扣减 ——
+    顺序只影响被观测方看不到的分布，且这样得到的仍是合法上界池。
+    """
+    captured = captured or {"r": {}, "b": {}}
+    unknown_captured = unknown_captured or {"r": 0, "b": 0}
+    pool = empty_pool()
+    bounds = {"r": {}, "b": {}}
+    for color in ("r", "b"):
+        revealed = board.revealed_counts(color)
+        cap = captured.get(color, {})
+        for kind, total in FULL_SET.items():
+            if kind == "K":
+                continue
+            n = total - revealed.get(kind, 0) - cap.get(kind, 0)
+            n = max(0, n)
+            pool[color][kind] = n
+            bounds[color][kind] = n
+        # 先按上界池对齐（可能超，也可能不足）
+        _align_pool_to_hidden(board, color, pool)
+        # 再处理「被吃掉但看不清兵种」的差额：从池里挑兵种扣，
+        # 优先扣数量最多的（最可能是它），尽量少破坏信息
+        hidden = board.hidden_count(color)
+        for _ in range(int(unknown_captured.get(color, 0))):
+            order = sorted([k for k in POOL_ORDER if pool[color].get(k, 0) > 0],
+                           key=lambda k: -pool[color][k])
+            if not order:
+                break
+            pool[color][order[0]] -= 1
+            hidden -= 1
+        _align_pool_to_hidden(board, color, pool)
+    return pool, bounds
+
+
+def default_pool_guess_legacy(board, captured=None):
+    """旧口径：把被吃子按兵种直接扣减（信息上偏乐观，保留作对照/回退）。"""
     pool = empty_pool()
     captured = captured or {"r": {}, "b": {}}
     for color in ("r", "b"):
@@ -470,7 +524,6 @@ def default_pool_guess(board, captured=None):
                 continue
             n = total - revealed.get(kind, 0) - cap.get(kind, 0)
             pool[color][kind] = max(0, n)
-        # 强制对齐暗子数量
         _align_pool_to_hidden(board, color, pool)
     return pool
 

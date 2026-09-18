@@ -34,7 +34,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout,
 
 from jq_board import (
     Position, Board, Piece, ROWS, COLS, analyze_transition,
-    move_to_chinese, move_to_uci, uci_to_move, default_pool_guess,
+    move_to_chinese, move_to_uci, uci_to_move, default_pool_guess, pool_from_bounds,
     pool_to_string, pool_sums, KIND_NAMES, KIND_NAMES_BLACK, kind_name,
     align_pool, effective_kind, side_from_moved_colors, side_from_start,
 )
@@ -224,6 +224,8 @@ class MainWindow(QMainWindow):
         self._last_captured = {"r": {}, "b": {}}
         self._last_captured_unknown = {"r": 0, "b": 0}
         self._auto_pool = True
+        # 用户是否在编辑局面弹窗里手动调过暗子池 → 手动值优先，不再自动推算
+        self._pool_manual = False
         # 用户是否在本次连线里手动指定过执方（没指定过就一直默认红先）
         self._side_user_set = False
         self._restart_at = 0.0
@@ -704,7 +706,7 @@ class MainWindow(QMainWindow):
         if self._good_streak < 2:
             return
 
-        new_pool = default_pool_guess(det.board, self._last_captured) if self._auto_pool else None
+        new_pool = self._pool_from_detection(det) if self._auto_pool else None
 
         if not self.synced:
             self._accept_position(det.board, new_pool, side=None, note="初始同步")
@@ -755,6 +757,19 @@ class MainWindow(QMainWindow):
             self._pending_since = now
             self.status_msg = "局面变化存疑，观察中（2.5s）：" + "；".join(reason)
 
+    def _pool_from_detection(self, det):
+        """按这次识别结果推算暗子池（最坏情况口径，不猜隐藏信息）。
+
+        被吃子区里读数"看得清"的（明子身份的框）当作已确认；
+        按不确定身份框的数量，作为「被吃掉但看不清兵种」的差额交给 pool_from_bounds。
+        """
+        known, unknown = tray_captured_counts(det.tray, det.board)
+        n_unknown = {"r": 0, "b": 0}
+        for color in ("r", "b"):
+            n_unknown[color] = int(unknown.get(color, 0))
+        pool, _bounds = pool_from_bounds(det.board, known, n_unknown)
+        return pool
+
     def _apply_transition(self, det, trans, new_pool, force=False):
         """把一次识别到的局面变化落成新局面（处理翻子/吃子/rule40/执方）。"""
         n_moved = len(trans["vacated"])
@@ -777,7 +792,13 @@ class MainWindow(QMainWindow):
             rule40 = 0 if (reveal or capture) else self.position.rule40 + abs(n_moved)
         pool = new_pool
         if pool is None:
-            pool = {c: dict(self.position.pool.get(c, {})) for c in ("r", "b")}
+            # 用户手动编辑过暗子池 → 尊重手动值，**绝不**用识别结果去猜。
+            # （旧代码在这里无条件调用 default_pool_guess，等于把对手吃掉什么
+            #   暗子的隐藏信息又"猜"了一遍，把手动设置也覆盖掉了。）
+            if self._pool_manual:
+                pool = {c: dict(self.position.pool.get(c, {})) for c in ("r", "b")}
+            else:
+                pool = self._pool_from_detection(det)
             align_pool(det.board, pool)
         pos = Position(det.board.copy(), side, pool)
         pos.rule40 = rule40
@@ -938,6 +959,7 @@ class MainWindow(QMainWindow):
         self.move_history = []
         self.synced = False
         self._auto_pool = True
+        self._pool_manual = False
         self._side_user_set = False
         self.board.last_move = None
         self.board.selected = None
@@ -972,6 +994,7 @@ class MainWindow(QMainWindow):
         if dlg.exec():
             self.position = dlg.current_position()
             self._auto_pool = False
+            self._pool_manual = True
             self._side_user_set = True
             self.synced = False
             self.board.selected = None
@@ -998,6 +1021,7 @@ class MainWindow(QMainWindow):
         self.position = pos
         self.synced = False
         self._auto_pool = False
+        self._pool_manual = True
         self._side_user_set = True
         self.status_msg = "已从剪贴板载入局面"
         self._after_position_change()
