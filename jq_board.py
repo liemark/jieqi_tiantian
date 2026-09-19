@@ -802,6 +802,114 @@ def align_pool(board, pool):
     return pool
 
 
+# --------------------------------------------------------------------------
+# 结构化修复：把「走子提示白圈被误认成棋子」这种情况还原回去
+# --------------------------------------------------------------------------
+
+def repair_stray_apparition(old_board, new_board, trans):
+    """修复「走子后原位置凭空多出一个子」这种误识别（走子提示白圈被判成棋子）。
+
+    场景：某子从 A 走到 B，A 处留下一个走子提示白圈，白圈被模型认成了某个棋子。
+    于是新画面里除了 B 有子，A 处也多了一个"本该不存在"的子。
+
+    这个误判在新旧局面的差异里会呈现多种形态（取决于 A 处旧局面是什么、
+    以及真实那一步有没有吃子）：
+      A 旧局面是空格                     -> A 记为 arrived（凭空多出一个子）
+      A 旧局面是暗子、新的是同色明子      -> A 记为 revealed（"原地翻开"）
+      A 旧局面与新材料不同色（含旧暗子被判成对方子）-> A 记为 replaced
+      真实那一步还是吃子                  -> 落点也记为 replaced（于是 replaced 有两格）
+
+    所以不能只盯死某一种形态。这里统一用「候选起点 + 合法落点」来推：
+      对每一个"异常变动格"A（vacated/revealed/replaced 里的格）假设它就是起点，
+        * 用旧局面上 A 处的子算出合法走法集合 legal；
+        * 新画面里发生变化的格里，凡是落在 legal 内、且与走子方颜色相符的，
+          就当作真实落点 R（多个候选时用兵种/颜色收敛，仍分不出就放弃）；
+        * A 本身以及其余"多出来"的格 S 都必须是旧局面的空格（凭空看见的），
+          否则说明这里有真实吃子，放弃修复。
+
+    修法：把 A 和 S 清空，保留 R 与真实吃子格。
+
+    返回 (fixed_board, 清空的格列表, 真实落点列表)；不满足条件返回 None。
+    """
+    if not trans:
+        return None
+
+    changed_odd = (list(trans.get("vacated", [])) + list(trans.get("revealed", []))
+                   + list(trans.get("replaced", [])))
+    moved_to = list(trans.get("arrived", []))
+    if not changed_odd:
+        return None
+
+    for frm in changed_odd:
+        mover = old_board.get(*frm)
+        if mover is None:
+            continue
+        legal = set(old_board.moves_of_piece(*frm))
+
+        # 候选真实落点：发生变化的格（含被吃格），在合法走法内，且不是起点自己
+        cand = [sq for sq in (moved_to + list(trans.get("replaced", [])))
+                if sq != frm and sq in legal]
+        if not cand:
+            continue
+
+        # 颜色必须和走子方一致（同色才可能是它走过去的）
+        cand = [sq for sq in cand
+                if (new_board.get(*sq) is not None
+                    and new_board.get(*sq).color == mover.color)]
+        if not cand:
+            continue
+        # 多个候选时优先兵种也对的；仍不唯一就放弃，避免瞎猜
+        if len(cand) > 1 and not mover.dark:
+            same_kind = [sq for sq in cand if new_board.get(*sq).kind == mover.kind]
+            if same_kind:
+                cand = same_kind
+        if len(cand) != 1:
+            continue
+        real = cand[0]
+
+        # 起点自己要被清空；其余变动格若是旧局面的空格，也一并清空
+        strays = []
+        if frm not in trans.get("vacated", []):
+            strays.append(frm)          # 形态 2/3：起点现在还被误判的子占着
+        bad = False
+        for sq in changed_odd:
+            if sq == frm or sq == real:
+                continue
+            if old_board.get(*sq) is not None:
+                bad = True              # 旧局面本来有子 -> 真实吃子，别动
+                break
+            strays.append(sq)
+        for sq in moved_to:
+            if sq == real or sq in strays:
+                continue
+            if old_board.get(*sq) is not None:
+                bad = True
+                break
+            strays.append(sq)
+        if bad or not strays:
+            continue
+
+        fixed = new_board.copy()
+        for sq in strays:
+            fixed.set(sq[0], sq[1], None)
+        return fixed, strays, [real]
+
+    return None
+
+
+def stray_apparition_details(old_board, new_board, trans):
+    """只做判断、不做修改，返回 (可修复?, 说明文本)。用于界面提示。"""
+    r = repair_stray_apparition(old_board, new_board, trans)
+    if r is None:
+        return False, ""
+    _fixed, strays, real_targets = r
+    def cn(sq):
+        return f"{chr(ord('a') + sq[1])}{ROWS - sq[0]}"
+    return True, (f"原位置 {cn(trans['vacated'][0])} 凭空多出棋子 "
+                  f"{[cn(s) for s in strays]}，已按走子提示圈忽略；"
+                  f"实际落点 {[cn(s) for s in real_targets]}")
+
+
 def side_from_moved_colors(old_board, trans, n_moved=None):
     """根据「这一步动的是哪一方的子」推断下一步该谁走。
 

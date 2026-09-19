@@ -37,6 +37,7 @@ from jq_board import (
     move_to_chinese, move_to_uci, uci_to_move, default_pool_guess, pool_from_bounds,
     pool_to_string, pool_sums, KIND_NAMES, KIND_NAMES_BLACK, kind_name,
     align_pool, effective_kind, side_from_moved_colors, side_from_start,
+    repair_stray_apparition,
 )
 from jq_engine import EngineHandler, score_text, wdl_text, sanitize_fen, JIEQI_START_FEN
 from jq_detect import detect_raw, parse_board, get_session, CLASS_NAMES, CLS_INFO, \
@@ -720,6 +721,17 @@ class MainWindow(QMainWindow):
             self._pending_key = None
             return
 
+        # ---- 结构容错：先尝试还原「原位置凭空多出一个子」的误识别 ----
+        # 走子提示白圈偶尔会被认成某个棋子，表现为「1 格走空 + 2 格多出子」，
+        # 走法校验必然失败。这里按证据把它还原成真实的那一步。
+        repaired = repair_stray_apparition(self.position.board, det.board, trans)
+        if repaired is not None:
+            fixed_board, strays, real_targets = repaired
+            det.board = fixed_board
+            trans = analyze_transition(self.position.board, fixed_board)
+            n_moved = len(trans["vacated"])
+            n_arrived = len(trans["arrived"]) + len(trans["replaced"])
+
         # 额外的合理性检查：一步棋只可能“不减少棋子”或“少吃一个”
         n_old = sum(1 for _ in self.position.board.pieces())
         n_new = sum(1 for _ in det.board.pieces())
@@ -735,7 +747,10 @@ class MainWindow(QMainWindow):
                                       (trans["arrived"] + trans["replaced"])[-1])
             self._apply_transition(det, trans, new_pool)
             self._pending_key = None
-            self.status_msg = f"识别到 {n_moved} 步：{chinese}"
+            tip = f"识别到 {n_moved} 步：{chinese}"
+            if repaired is not None:
+                tip += "（已忽略走子提示圈误判成的棋子）"
+            self.status_msg = tip
             return
 
         # 无法解释 → 观察期
