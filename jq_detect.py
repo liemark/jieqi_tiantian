@@ -1,8 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-jq_detect.py —— 用 YOLO(ONNX) 识别天天象棋揭棋画面，解析成 10x9 棋盘
+jq_detect.py —— 识别总入口：把一帧画面解析成 10x9 棋盘
 
-模型：best.onnx，YOLOv5 风格输出 [1, 25200, 4 + 1(obj) + nc]，输入 640x640
+支持两种后端，由 ONNX 自带的元数据字段 `arch` 自动选择（见 load_model）：
+  * `jqnet` —— **JieqiLatticeNet**（推荐）：结构化 9x10 网格模型。
+      几何（交点矩形 4 个数，[CLS] token 回归）+ 90 个格子逐格 18 分类
+      + 单通道「棋盘外有子」热力图。见 jq_lattice.py。
+  * `yolo`  —— YOLOv5 风格通用检测输出 [1, 25200, 4 + 1(obj) + nc]，输入 640x640。
+
+两者产出**完全相同**的 Detection 对象，上层不用关心用的是哪个。
+
 类别（18 类模型）：
     0 board, 1..7 黑(车马象士将炮兵), 8 black_an,
     9..15 红(车马相仕帅炮兵), 16 red_an, 17 white_point(走子提示白圈，忽略)
@@ -11,7 +18,7 @@ jq_detect.py —— 用 YOLO(ONNX) 识别天天象棋揭棋画面，解析成 10
 关键设计（对应揭棋的特殊性）：
   * board 框的左上/右下角 = 最左上/最右下棋子的中心 → 棋盘格间距 = (x2-x1)/8, (y2-y1)/9；
     真正棋盘还要往外半个格。
-  * 棋盘外的棋子（被吃掉的子）一律忽略，并且单独收集起来用于推断暗子池。
+  * 棋盘外的棋子（被吃掉的子）一律忽略，不参与盘面也不参与暗子池。
   * 朝向必须先判定，再用（标准朝向的）初始格集合纠正 black_an / red_an 的颜色混淆。
   * 识别结果做多重校验（每方 16 子、各兵种上限、将帅唯一且必须存在），
     不通过则尝试修复并降低置信度。
@@ -30,7 +37,27 @@ from jq_board import (
 )
 from jq_paths import find_asset
 
-MODEL_PATH = find_asset("best.onnx")
+def _pick_default_model():
+    """默认模型：优先结构化模型 jqnet.onnx，没有才退回 YOLOv5 的 best.onnx。
+
+    优先级（"用户明确放的同名文件"永远赢过打包内的）：
+        外部 jqnet.onnx > 外部 best.onnx > 打包内 jqnet.onnx > 打包内 best.onnx
+    """
+    from jq_paths import is_frozen, user_dir, resource_dir
+    names = ("jqnet.onnx", "best.onnx")
+    if is_frozen():
+        for n in names:
+            p = os.path.join(user_dir(), n)
+            if os.path.exists(p):
+                return p
+    for n in names:
+        p = os.path.join(resource_dir(), n)
+        if os.path.exists(p):
+            return p
+    return os.path.join(resource_dir(), names[-1])
+
+
+MODEL_PATH = _pick_default_model()
 
 INPUT_SIZE = 640
 CONF_THRESH = 0.35
@@ -75,6 +102,10 @@ MODEL_CLASS_NAMES = list(DEFAULT_CLASS_NAMES)    # 模型原始类名（含提�
 POS_TOL = 0.42
 # 棋盘外多远以内算“被吃子区”（以格为单位）
 TRAY_RANGE = 3.0
+# 被吃子区识别结果的最低分。YOLO 后端在棋盘外的框通常 0.5+，用 0.25 就够；
+# 结构化模型的目标头在棋盘外置信度整体偏低（它主要精力在 90 个格子上），
+# 阈值放宽到 0.15，多余的误检由 tray_captured_counts() 的“每方缺子数”预算兜住。
+TRAY_MIN_SCORE = 0.25
 
 
 def _parse_names_metadata(text):
@@ -147,11 +178,15 @@ CLASS_CONFIG = {}
 
 _session = None
 _session_path = None
+# 当前模型的架构：'yolo'（YOLOv5 风格输出）/ 'jqnet'（JieqiLatticeNet 结构化网格模型）
+# 由 ONNX 元数据里的 arch 字段决定，parse_board 据此选择后端。
+ARCH = "yolo"
+MODEL_META = {}
 
 
 def load_model(model_path=MODEL_PATH, force=False):
     """显式加载（或切换）ONNX 模型，并按模型自带的 names 元数据刷新类别映射。"""
-    global _session, _session_path, CLASS_CONFIG
+    global _session, _session_path, CLASS_CONFIG, ARCH, MODEL_META, TRAY_MIN_SCORE
     path = os.path.abspath(model_path)
     if _session is not None and not force and _session_path == path:
         return _session
@@ -170,12 +205,25 @@ def load_model(model_path=MODEL_PATH, force=False):
     _session = ort.InferenceSession(path, sess_options=so, providers=providers)
     _session_path = path
     names = {}
+    meta = {}
     try:
         meta = dict(_session.get_modelmeta().custom_metadata_map)
         names = _parse_names_metadata(meta.get("names", ""))
     except Exception:
+        meta = {}
         names = {}
     CLASS_CONFIG = configure_classes(names)
+    MODEL_META = meta
+    ARCH = str(meta.get("arch", "yolo")).strip().lower() or "yolo"
+    if ARCH == "jqnet":
+        # 结构化模型按自己的输入尺寸做 letterbox
+        TRAY_MIN_SCORE = float(meta.get("tray_min_score", 0.15))
+        try:
+            globals()["INPUT_SIZE"] = int(meta.get("input_size", INPUT_SIZE))
+        except Exception:
+            pass
+    else:
+        TRAY_MIN_SCORE = 0.25
     return _session
 
 
@@ -304,6 +352,7 @@ class Detection:
         self.orient_src = "默认"        # 朝向判定依据（将帅/明子分布/默认）
         self.orient_certain = True
         self.tray = []                 # 棋盘外的棋子（被吃子区）[(cls, score, cx, cy)]
+        self.ignored = []              # 棋盘外被忽略的东西 [(score, cx, cy)]（结构化后端用）
         self.noise = []                # 落在棋盘范围内但没对上交叉点 → 直接丢弃
         self.hint_points = []          # 被忽略的提示标记（如 white_point）[(cls,score,x1,y1,x2,y2)]
         self.cell_scores = [[0.0] * COLS for _ in range(ROWS)]
@@ -473,23 +522,51 @@ def _refine_grid(pts, x1, y1, cw, ch):
 def parse_board(img, conf_thres=CONF_THRESH, iou_thres=IOU_THRESH, debug=False, origin=(0, 0)):
     """识别一帧图像，返回 Detection。
     origin=(ox,oy) 表示 img 是从整幅画面裁剪出来的子图，返回的所有坐标都会加上这个偏移，
-    这样上层（预览绘制、ROI 更新）始终使用整幅画面的坐标系。"""
+    这样上层（预览绘制、ROI 更新）始终使用整幅画面的坐标系。
+
+    按当前加载的 ONNX 模型自动选择后端：
+      * YOLOv5 风格（[1,25200,5+nc]）—— 通用检测 + 网格拟合
+      * JieqiLatticeNet —— 结构化网格分类（见 jq_lattice.py）
+    两者的 Detection 语义完全一致（board_box / grid_origin / cell_w,h / tray / hint_points ...）。
+    """
     ox0, oy0 = int(origin[0]), int(origin[1])
     det = Detection()
+
+    if ARCH == "jqnet":
+        from jq_lattice import detect_cells
+        cells = detect_cells(det, img, conf_thres, debug)
+        if cells is None:
+            return _shift_det(det, ox0, oy0)
+    else:
+        cells = _detect_cells_yolo(det, img, conf_thres, iou_thres)
+        if cells is None:
+            return det
+
+    _assemble_board(det, cells, debug)
+    if ox0 or oy0:
+        _shift_det(det, ox0, oy0)
+    return det
+
+
+def _detect_cells_yolo(det, img, conf_thres, iou_thres):
+    """YOLO 后端：跑检测 → 定棋盘框 → 精修网格 → 把框落到格子上。
+
+    返回 cells: {(row,col): [(score, cid, cx, cy)]}，失败返回 None。
+    """
     boxes, scores, cls_ids = detect_raw(img, conf_thres, iou_thres)
 
     # ---- 1. 棋盘框 ----
     board_idx = [i for i, c in enumerate(cls_ids) if int(c) == BOARD_CLASS]
     if not board_idx:
         det.problems.append("未检测到棋盘框")
-        return det
+        return None
     best = max(board_idx, key=lambda i: scores[i])
     bx1, by1, bx2, by2 = [float(v) for v in boxes[best]]
     det.board_box = (bx1, by1, bx2, by2)
     det.board_score = float(scores[best])
     if bx2 - bx1 < 40 or by2 - by1 < 40:
         det.problems.append("棋盘框过小")
-        return det
+        return None
 
     cw = (bx2 - bx1) / (COLS - 1)
     ch = (by2 - by1) / (ROWS - 1)
@@ -543,7 +620,14 @@ def parse_board(img, conf_thres=CONF_THRESH, iou_thres=IOU_THRESH, debug=False, 
             det.noise.append((cid, sc, cx, cy))
     det.grid_fit_err = float(np.mean(fit_errs)) if fit_errs else 0.0
     det.tray = _dedup_tray(det.tray, cw, ch)
+    return cells
 
+
+def _assemble_board(det, cells, debug=False):
+    """由「逐格候选」组装出最终棋盘（两个后端共用，保证行为完全一致）。
+
+    cells: {(row, col): [(score, cid, cx, cy)]}，坐标是**画面原始朝向**。
+    """
     # ---- 4. 先判定朝向（必须在判暗子颜色之前！）----
     # 陷阱：暗子初始格集合 RED_DARK_SQUARES / BLACK_DARK_SQUARES 是“红下黑上”的标准坐标，
     # 而画面可能是黑方在下（= 标准坐标旋转 180°）。旋转 180° 恰好把两个集合互换，
@@ -607,19 +691,25 @@ def parse_board(img, conf_thres=CONF_THRESH, iou_thres=IOU_THRESH, debug=False, 
     det.problems.extend(board.validate())
     det.n_pieces_on_board = sum(1 for _ in board.pieces())
     det.ok = len([p for p in det.problems if "暗子池" not in p]) == 0
+    return det
 
-    # ---- 8. 若是子图识别，把坐标换算回整幅画面 ----
-    if ox0 or oy0:
+
+def _shift_det(det, ox0, oy0):
+    """子图识别时把坐标换算回整幅画面。"""
+    if not (ox0 or oy0):
+        return det
+    if det.board_box:
         det.board_box = (det.board_box[0] + ox0, det.board_box[1] + oy0,
                          det.board_box[2] + ox0, det.board_box[3] + oy0)
-        if det.grid_origin:
-            det.grid_origin = (det.grid_origin[0] + ox0, det.grid_origin[1] + oy0)
-        det.raw_boxes = [(c, s, x1 + ox0, y1 + oy0, x2 + ox0, y2 + oy0, p)
-                         for (c, s, x1, y1, x2, y2, p) in det.raw_boxes]
-        det.tray = [(c, s, cx + ox0, cy + oy0) for (c, s, cx, cy) in det.tray]
-        det.noise = [(c, s, cx + ox0, cy + oy0) for (c, s, cx, cy) in det.noise]
-        det.hint_points = [(c, s, x1 + ox0, y1 + oy0, x2 + ox0, y2 + oy0)
-                           for (c, s, x1, y1, x2, y2) in det.hint_points]
+    if det.grid_origin:
+        det.grid_origin = (det.grid_origin[0] + ox0, det.grid_origin[1] + oy0)
+    det.raw_boxes = [(c, s, x1 + ox0, y1 + oy0, x2 + ox0, y2 + oy0, p)
+                     for (c, s, x1, y1, x2, y2, p) in det.raw_boxes]
+    det.tray = [(c, s, cx + ox0, cy + oy0) for (c, s, cx, cy) in det.tray]
+    det.ignored = [(s, cx + ox0, cy + oy0) for (s, cx, cy) in det.ignored]
+    det.noise = [(c, s, cx + ox0, cy + oy0) for (c, s, cx, cy) in det.noise]
+    det.hint_points = [(c, s, x1 + ox0, y1 + oy0, x2 + ox0, y2 + oy0)
+                       for (c, s, x1, y1, x2, y2) in det.hint_points]
     return det
 
 
@@ -746,6 +836,14 @@ def render_preview(img, det, max_w=380):
     for (cid, sc, x1, y1, x2, y2) in det.hint_points:
         cv2.rectangle(vis, (int(x1 * s), int(y1 * s)), (int(x2 * s), int(y2 * s)),
                       (255, 0, 255), 1)
+    # 棋盘外的东西：YOLO 后端列在 tray 里（橙圈），结构化后端列在 ignored 里（灰圈 + 叉）。
+    # 两者都不会进盘面，画出来只是让用户能核对"确实被无视了"。
     for (cid, sc, cx, cy) in det.tray:
         cv2.circle(vis, (int(cx * s), int(cy * s)), 5, (255, 120, 0), 2)
+    for (sc, cx, cy) in det.ignored:
+        x, y = int(cx * s), int(cy * s)
+        r = max(4, int((det.cell_h or 20) * 0.28 * s))
+        cv2.circle(vis, (x, y), r, (120, 120, 120), 1)
+        cv2.line(vis, (x - 4, y - 4), (x + 4, y + 4), (120, 120, 120), 1)
+        cv2.line(vis, (x + 4, y - 4), (x - 4, y + 4), (120, 120, 120), 1)
     return vis

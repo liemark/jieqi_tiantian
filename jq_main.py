@@ -42,6 +42,9 @@ from jq_board import (
 from jq_engine import EngineHandler, score_text, wdl_text, sanitize_fen, JIEQI_START_FEN
 from jq_detect import detect_raw, parse_board, get_session, CLASS_NAMES, CLS_INFO, \
     tray_captured_counts, render_preview, MODEL_PATH, current_model_path, IGNORED_CLASSES
+# ARCH / INPUT_SIZE / TRAY_MIN_SCORE 是 load_model() 在运行时按模型元数据刷新的，
+# 所以要用模块引用读当前值，不能在 import 时按值拷贝。
+import jq_detect as _jqd
 from jq_capture import WindowCapture, ScreenCapture
 from jq_paths import find_asset, resource_dir, user_dir, is_frozen
 from jq_ui import (THEME, STYLESHEET, BoardWidget, PositionEditorDialog,
@@ -190,7 +193,7 @@ class MainWindow(QMainWindow):
     def __init__(self, settings=None):
         super().__init__()
         self.settings = settings or load_settings()
-        self.setWindowTitle("揭棋 · 皮卡鱼实时分析")
+        self.setWindowTitle("揭棋 · 天天象棋连线")
         self.resize(1280, 820)
 
         get_session(MODEL_PATH)   # 主线程里先建好会话，避免多线程竞争
@@ -342,6 +345,10 @@ class MainWindow(QMainWindow):
         t.setObjectName("Title")
         ph.addWidget(t)
         ph.addStretch(1)
+        self.lb_model = QLabel("模型")
+        self.lb_model.setObjectName("Sub")
+        self.lb_model.setToolTip("当前识别后端（按 ONNX 元数据的 arch 字段自动选择）")
+        ph.addWidget(self.lb_model)
         self.lb_det = QLabel("—")
         self.lb_det.setObjectName("Sub")
         ph.addWidget(self.lb_det)
@@ -483,7 +490,7 @@ class MainWindow(QMainWindow):
             nnue_path=self.settings.get("nnue_path", ""),
         )
         if self.engine.ok and not self.engine.is_jieqi:
-            self.status_msg = "警告：引擎不是揭棋构建？"
+            self.status_msg = "警告：引擎不是揭棋引擎？"
         elif not self.engine.ok:
             self.status_msg = f"引擎启动失败：{self.engine.last_error}"
 
@@ -778,7 +785,8 @@ class MainWindow(QMainWindow):
         被吃子区里读数"看得清"的（明子身份的框）当作已确认；
         按不确定身份框的数量，作为「被吃掉但看不清兵种」的差额交给 pool_from_bounds。
         """
-        known, unknown = tray_captured_counts(det.tray, det.board)
+        known, unknown = tray_captured_counts(det.tray, det.board,
+                                              min_score=_jqd.TRAY_MIN_SCORE)
         n_unknown = {"r": 0, "b": 0}
         for color in ("r", "b"):
             n_unknown[color] = int(unknown.get(color, 0))
@@ -871,15 +879,21 @@ class MainWindow(QMainWindow):
         self.lb_turn.setText(f"{turn}行棋")
         self.lb_turn.setStyleSheet(
             "color:%s" % ("#ff6b6b" if self.position.side == "w" else "#8ab4ff"))
+        self.lb_model.setText(model_badge())
         if self.live_on and self.detection:
             det = self.detection
             self.lb_conf.setText(f"识别 {det.confidence * 100:.0f}%  " +
                                  ("稳定" if self._good_streak >= 2 else "确认中"))
-            self.lb_det.setText(det.summary() if det.ok else "识别失败")
+            txt = det.summary() if det.ok else "识别失败"
+            if det.ignored:
+                txt += f"   （棋盘外忽略 {len(det.ignored)}）"
+            self.lb_det.setText(txt)
         elif self.live_on:
             self.lb_conf.setText("识别中…")
+            self.lb_det.setText("—")
         else:
             self.lb_conf.setText("识别：未连线")
+            self.lb_det.setText("—")
         self.lb_status.setText(self.status_msg)
         self.fen_edit.setText(self.position.fen())
 
@@ -1116,7 +1130,7 @@ HELP_TEXT = """\
 2. 识别说明
    • 棋盘框的左上/右下角是“最左上棋子中心”和“最右下棋子中心”，
      程序据此推出 9×10 的交叉点网格。
-   • 棋盘外的棋子（被吃掉的子）会被忽略，同时用来推算暗子池。
+   • 棋盘外的棋子（被吃掉的子）会被忽略，绝不进盘面、也不算被吃子身份。
    • 暗子必定落在初始格上，程序用这一点 100% 纠正红/黑暗子混淆。
    • 识别不通过校验时不会刷新局面，只提示“识别不可靠”。
 
@@ -1130,12 +1144,21 @@ HELP_TEXT = """\
    点「编辑局面…」打开弹窗：
    • 左边棋盘点一下就能放子；选「暗子」笔刷时颜色按初始格自动判定。
    • 右边可以逐项调整暗子池（数量之和必须等于盘面暗子数，否则引擎会崩）。
-   • 「自动推算」= 全套棋子 − 盘面明子 − 棋盘外被吃子。
-   • 底部有实时校验，非法会红字提示。
+   • 「自动推算」= 全套棋子 − 盘面明子（− 棋盘外能看清兵种的被吃子）。
+     棋盘外被吃掉的子一般不猜身份：暗子池的总数由盘面自己就能推出来，
+     猜兵种等于把对手看不到的隐藏信息当成已知。
 
 5. 走子与换执方
    识别到 1 步时自动换执方；也可手动「换执方」。点棋盘选中棋子会显示可走点，
    双击右侧着法可试走。识别出错时可用「编辑局面」或强制走子修正。
+
+6. 识别后端
+   「识别预览」标题右边会显示当前用的是哪个模型：
+   • 「网格模型 jqnet.onnx」= JieqiLatticeNet，把棋盘当成 9x10 网格逐格分类：
+     走子提示白圈结构上不可能变成棋子；棋盘外的被吃子在预览里画成灰圈+叉，
+     表示"看到了但直接无视"。
+   • 「检测模型 best.onnx」= YOLOv5 风格通用检测（旧后端，保留兼容）。
+   把想用的 onnx 放到 exe 旁边同名即可切换，不用改任何设置。
 """
 
 
@@ -1178,6 +1201,17 @@ class _Tee:
                 pass
 
 
+def model_badge():
+    """给界面用的一句话模型说明，例如「网格模型 jqnet.onnx」。"""
+    try:
+        name = os.path.basename(current_model_path() or MODEL_PATH)
+    except Exception:
+        name = "—"
+    if _jqd.ARCH == "jqnet":
+        return f"网格模型 {name}"
+    return f"检测模型 {name}"
+
+
 def _bundle_check(out):
     """打包版在没有 test 图片时的自检：模型 / 引擎 / 棋子图片 / 可写目录。"""
     ok = True
@@ -1191,9 +1225,17 @@ def _bundle_check(out):
     try:
         get_session(MODEL_PATH)
         out.write(f"  路径 : {current_model_path()}\n")
+        out.write(f"  架构 : {_jqd.ARCH}")
+        if _jqd.ARCH == "jqnet":
+            out.write("  (JieqiLatticeNet 结构化网格模型：逐格分类 + 目标头管棋盘外)")
+        else:
+            out.write("  (YOLOv5 风格通用检测)")
+        out.write("\n")
+        out.write(f"  输入 : {_jqd.INPUT_SIZE}x{_jqd.INPUT_SIZE}\n")
         out.write(f"  类别数: {len(CLASS_NAMES)}\n")
         out.write(f"  棋子类: {len(CLS_INFO)} 个\n")
         out.write(f"  忽略类: {[CLASS_NAMES[i] for i in sorted(IGNORED_CLASSES)] or '无'}\n")
+        out.write(f"  被吃子区最低分: {_jqd.TRAY_MIN_SCORE}\n")
     except Exception as e:
         out.write(f"  [!!]   模型加载失败: {e}\n")
         ok = False
@@ -1240,12 +1282,18 @@ def _bundle_check(out):
         out.write(f"  [!!]   引擎自检异常: {e}\n")
         ok = False
 
-    # 用一张合成图确认推理链路（应该是"未检测到棋盘框"，即不崩）
+    # 用一张合成图确认推理链路不崩即可。
+    # 注意两种后端的失败表现不同：
+    #   YOLO 后端      → 检测不到棋盘框，problems 里是"未检测到棋盘框"
+    #   结构化后端     → 几何头总会给出一个网格，所以会走到"未识别到将/帅"这类校验失败
+    # 这里只要求"能跑完、不抛异常"。
     out.write("\n【推理链路】\n")
     try:
         blank = np.full((720, 720, 3), 120, dtype=np.uint8)
         det = parse_board(blank)
-        out.write(f"  合成图推理完成，problems={det.problems}（预期为未检测到棋盘框）\n")
+        hint = "未检测到棋盘框" if _jqd.ARCH != "jqnet" else "校验失败（预期：空白图上认不出将/帅）"
+        out.write(f"  合成图推理完成，未抛异常，problems={det.problems}\n")
+        out.write(f"  （预期表现：{hint}）\n")
     except Exception as e:
         out.write(f"  [!!]   推理异常: {e}\n")
         ok = False
@@ -1324,8 +1372,13 @@ def selftest(test_dir=None):
                   f"格距={det.cell_w:.1f}x{det.cell_h:.1f} 网格误差={det.grid_fit_err:.3f}\n")
         out.write(f"  朝向：{'红下黑上' if det.red_bottom else '黑下红上'}   "
                   f"问题：{det.problems or '无'}\n")
-        out.write(f"  棋盘外识别到棋子 {len(det.tray)} 个（已忽略）：" +
-                  ", ".join(f"{CLASS_NAMES[c]}({s:.2f})" for c, s, _, _ in det.tray) + "\n")
+        if det.tray:
+            out.write(f"  棋盘外识别到棋子 {len(det.tray)} 个（已忽略，不参与盘面/暗子池）：" +
+                      ", ".join(f"{CLASS_NAMES[c]}({s:.2f})" for c, s, _, _ in det.tray) + "\n")
+        elif det.ignored:
+            out.write(f"  棋盘外检测到 {len(det.ignored)} 处物体（直接忽视，不参与盘面/暗子池）\n")
+        else:
+            out.write("  棋盘外：没有检测到东西\n")
         txt = os.path.join(test_dir, os.path.splitext(f)[0] + ".txt")
         if not os.path.exists(txt):
             continue
@@ -1351,7 +1404,8 @@ def selftest(test_dir=None):
         out.write(f"  → 不符项 {bad}\n")
 
         # 端到端：生成 FEN → 引擎分析
-        known, unknown = tray_captured_counts(det.tray, det.board)
+        known, unknown = tray_captured_counts(det.tray, det.board,
+                                              min_score=_jqd.TRAY_MIN_SCORE)
         pool = default_pool_guess(det.board, known)
         pos = Position(det.board, "w", pool)
         out.write(f"  FEN: {pos.fen()}\n")

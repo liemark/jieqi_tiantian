@@ -2,7 +2,7 @@
 """
 jq_paths.py —— 路径解析：源码运行 / PyInstaller 打包后都能正确找到资源和可写目录
 
-* resource_dir()：只读资源（best.onnx、pieces/、pikafish-bmi2.exe）。
+* resource_dir()：只读资源（jqnet.onnx / best.onnx、pieces/、pikafish-bmi2.exe）。
   打包后是 PyInstaller 的解包目录 sys._MEIPASS。
 * user_dir()：可写目录（设置文件）。打包后优先用 exe 所在目录（便携），
   不可写时退回 %APPDATA%\\JieqiAnalyzer。
