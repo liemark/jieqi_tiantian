@@ -211,6 +211,9 @@ def main():
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--opt", default="muon", choices=["muon", "adamw"],
+                    help="muon = Muon(隐藏层权重) + AdamW(其余)；adamw = 全 AdamW")
+    ap.add_argument("--lr-muon", type=float, default=0.02)
     ap.add_argument("--wd", type=float, default=0.02)
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--input", type=int, default=640)
@@ -235,8 +238,9 @@ def main():
 
     bank = SpriteBank(os.path.join(HERE, "pieces"))
     tr = JieqiDataset(args.data, "train", args.input, True, bank, tray_max=args.tray_max,
-                      seed=args.seed)
-    va = JieqiDataset(args.data, "val", args.input, False, None, seed=args.seed)
+                      seed=args.seed, obj_stride=cfg.obj_stride)
+    va = JieqiDataset(args.data, "val", args.input, False, None, seed=args.seed,
+                      obj_stride=cfg.obj_stride)
     tl = DataLoader(tr, batch_size=args.batch, shuffle=True, num_workers=args.workers,
                     collate_fn=collate, drop_last=True, persistent_workers=args.workers > 0,
                     pin_memory=True, prefetch_factor=4 if args.workers > 0 else None)
@@ -253,18 +257,33 @@ def main():
         model.load_state_dict(sd.get("model", sd))
         print("[cfg] resumed", args.resume)
 
-    decay, no_decay = [], []
-    for n, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        (no_decay if p.ndim <= 1 else decay).append(p)
-    opt = torch.optim.AdamW([{"params": decay, "weight_decay": args.wd},
-                             {"params": no_decay, "weight_decay": 0.0}], lr=args.lr)
+    if args.opt == "muon":
+        from jqnet_optim import build_optimizers
+        opts = build_optimizers(model, lr_adamw=args.lr, lr_muon=args.lr_muon,
+                                wd=args.wd)
+    else:
+        decay, no_decay = [], []
+        for n, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            (no_decay if p.ndim <= 1 else decay).append(p)
+        opts = [torch.optim.AdamW([{"params": decay, "weight_decay": args.wd},
+                                   {"params": no_decay, "weight_decay": 0.0}], lr=args.lr)]
     steps = max(1, len(tl)) * args.epochs
     warm = min(500, steps // 20)
-    sched = torch.optim.lr_scheduler.LambdaLR(
-        opt, lambda it: (it + 1) / max(1, warm) if it < warm
-        else 0.5 * (1 + math.cos(math.pi * (it - warm) / max(1, steps - warm))))
+
+    def lr_lambda(it):
+        if it < warm:
+            return (it + 1) / max(1, warm)
+        return 0.5 * (1 + math.cos(math.pi * (it - warm) / max(1, steps - warm)))
+
+    # LambdaLR 只吃单个 optimizer，所以每个 optimizer 各挂一个同参数的调度器
+    scheds = [torch.optim.lr_scheduler.LambdaLR(o, lr_lambda) for o in opts]
+
+    def cur_lr():
+        return opts[0].param_groups[0]["lr"]
+
+    print("[opt] %s  warmup=%d steps  steps=%d" % (args.opt, warm, steps))
     ema = EMA(model, 0.999)
     scaler = torch.amp.GradScaler("cuda", enabled=False)   # bf16 不需要
     log = open(os.path.join(args.out, "train_log.txt"), "a", encoding="utf-8")
@@ -290,11 +309,14 @@ def main():
                                     batch["obj_mask"].to(device))
                 loss = (args.w_lattice * l_lat + args.w_cell * l_cell
                         + args.w_obj * (l_obj + l_off))
-            opt.zero_grad(set_to_none=True)
+            for o in opts:
+                o.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            opt.step()
-            sched.step()
+            for o in opts:
+                o.step()
+            for s in scheds:
+                s.step()
             ema.update(model)
             it += 1
             agg["n"] += 1
@@ -305,7 +327,7 @@ def main():
             if it % 25 == 0:
                 print(f"  ep{ep} it{it}/{steps} lat={agg['lattice']/agg['n']:.2f}px "
                       f"cell={agg['cell']/agg['n']:.4f} obj={agg['obj']/agg['n']:.4f} "
-                      f"off={agg['off']/agg['n']:.3f} lr={sched.get_last_lr()[0]:.2e} "
+                      f"off={agg['off']/agg['n']:.3f} lr={cur_lr():.2e} "
                       f"{time.time()-t0:.0f}s", flush=True)
         msg = (f"[ep {ep}] loss lat={agg['lattice']/agg['n']:.2f}px cell={agg['cell']/agg['n']:.4f} "
                f"obj={agg['obj']/agg['n']:.4f} off={agg['off']/agg['n']:.3f} "

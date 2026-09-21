@@ -184,13 +184,14 @@ def paste_sprite(canvas, cid, sprite, cx, cy, size):
 
 class JieqiDataset(Dataset):
     def __init__(self, root, split="train", input_size=640, train=True,
-                 sprite_bank=None, tray_max=8, seed=0):
+                 sprite_bank=None, tray_max=8, seed=0, obj_stride=OBJ_STRIDE):
         self.root = root
         self.split = split
         self.input_size = input_size
         self.train = train
         self.bank = sprite_bank
         self.tray_max = tray_max
+        self.obj_stride = int(obj_stride)   # 必须和模型 cfg.obj_stride 一致
         self.rng = random.Random(seed)
         img_dir = os.path.join(root, "images", split)
         lab_dir = os.path.join(root, "labels", split)
@@ -215,18 +216,18 @@ class JieqiDataset(Dataset):
             for c in range(COLS):
                 cell_cls[r * COLS + c] = grid[r][c]
 
-        oh, ow = H // OBJ_STRIDE, W // OBJ_STRIDE
+        oh, ow = H // self.obj_stride, W // self.obj_stride
         # 单通道「有子」热力图：棋盘外只需要知道「这里有东西」，不需要知道是什么兵种
         heat = np.zeros((NOBJ, oh, ow), np.float32)
         off = np.zeros((2, oh, ow), np.float32)
         mask = np.zeros((oh, ow), np.float32)
         for (cid, cx, cy, bw, bh) in objs:
-            fx = cx / OBJ_STRIDE
-            fy = cy / OBJ_STRIDE
+            fx = cx / self.obj_stride
+            fy = cy / self.obj_stride
             ix, iy = int(fx), int(fy)
             if not (0 <= ix < ow and 0 <= iy < oh):
                 continue
-            r = gaussian_radius(bw / OBJ_STRIDE, bh / OBJ_STRIDE)
+            r = gaussian_radius(bw / self.obj_stride, bh / self.obj_stride)
             draw_gaussian(heat[0], (ix, iy), r)
             if mask[iy, ix] == 0:
                 off[0, iy, ix] = fx - ix

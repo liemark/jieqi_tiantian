@@ -77,8 +77,9 @@ class NetCfg:
     cell_span: float = 1.30      # 窗口覆盖多少格（棋子本身约 0.95 格，留 0.35 格余量即可；
                                  # 再大就会把紧贴棋盘边的被吃子卷进窗口）
     cell_pool: int = 4           # 窗口编码后的空间尺寸
+    geo_pool: int = 1            # 几何 transformer 之前对特征图做的平均池化倍数
     obj_dim: int = 64
-    obj_stride: int = 4
+    obj_stride: int = 4          # 棋盘外目标头的步长（4 用 C2，8 用 C3）
     drop: float = 0.0
 
     def to_dict(self):
@@ -91,14 +92,30 @@ class NetCfg:
 
 
 PRESETS = {
-    "n": NetCfg(w0=16, n2=1, n3=1, n4=1, n5=1, geo_dim=192, geo_blocks=2,
-                cell_dim=128, cell_blocks=2, cell_heads=4, obj_dim=64),
-    "s": NetCfg(w0=24, n2=1, n3=2, n4=2, n5=1, geo_dim=224, geo_blocks=2,
-                cell_dim=160, cell_blocks=3, cell_heads=5, obj_dim=56),
-    "m": NetCfg(w0=32, n2=1, n3=2, n4=2, n5=1, geo_dim=256, geo_blocks=3,
-                cell_dim=192, cell_blocks=3, cell_heads=6, obj_dim=64),
-    "l": NetCfg(w0=40, n2=2, n3=3, n4=3, n5=2, geo_dim=320, geo_blocks=4,
-                cell_dim=256, cell_blocks=4, cell_heads=8, obj_dim=80),
+    # n = 默认档。profile 之后精简过的版本（见 REFACTOR_NOTES 注释）：
+    #   * stride16/32 不再挂残差块 —— 那条路径只服务「回归 4 个数」的几何头，
+    #     实测占掉全网络 56% 的 FLOPs，删掉后逐格精度不变而速度 -17%；
+    #   * 几何头先 2x2 平均池化（400 token -> 100），几何回归本来就不需要那么细；
+    #   * 棋盘外目标头 stride 4 -> 8（它只判「有没有子」，粗一半够用，算力 /4）；
+    #   * 格子窗口 16 -> 12：窗口跨度 1.3 格，40px 格子时只有 13 个 stride-4 特征点，
+    #     采 16 个点本来就过采样，12 个点正好贴着特征图分辨率。
+    # 合计 24.8ms -> 13.5ms（-46%），参数 3.59M -> 1.80M，ONNX 15.1MB -> 7.5MB。
+    "n": NetCfg(w0=16, n2=1, n3=1, n4=0, n5=0,
+                geo_dim=160, geo_blocks=2, geo_heads=8, geo_pool=2,
+                cell_dim=128, cell_blocks=2, cell_heads=4,
+                cell_win=12, cell_span=1.30, cell_pool=3,
+                obj_dim=48, obj_stride=8),
+    "nbase": NetCfg(w0=16, n2=1, n3=1, n4=1, n5=1, geo_dim=192, geo_blocks=2,
+                    cell_dim=128, cell_blocks=2, cell_heads=4, obj_dim=64),
+    "s": NetCfg(w0=24, n2=1, n3=2, n4=1, n5=0, geo_dim=192, geo_blocks=2,
+                geo_pool=2, cell_dim=160, cell_blocks=3, cell_heads=5,
+                cell_win=12, cell_pool=3, obj_dim=56, obj_stride=8),
+    "m": NetCfg(w0=32, n2=1, n3=2, n4=1, n5=0, geo_dim=224, geo_blocks=3,
+                geo_pool=2, cell_dim=192, cell_blocks=3, cell_heads=6,
+                cell_win=14, cell_pool=4, obj_dim=64, obj_stride=8),
+    "l": NetCfg(w0=40, n2=2, n3=3, n4=2, n5=1, geo_dim=320, geo_blocks=4,
+                geo_pool=2, cell_dim=256, cell_blocks=4, cell_heads=8,
+                cell_win=14, cell_pool=4, obj_dim=80, obj_stride=8),
 }
 
 
@@ -203,6 +220,14 @@ def sincos_2d(h, w, dim):
     return pe.reshape(h * w, dim)
 
 
+def _feat_size(size, stride):
+    """按 ConvBNAct(k=3,s=2,p=1) 的尺寸公式算输出边长。"""
+    s = size
+    for _ in range(int(math.log2(stride))):
+        s = (s - 1) // 2 + 1
+    return s, s
+
+
 # --------------------------------------------------------------------------
 # 主干
 # --------------------------------------------------------------------------
@@ -223,6 +248,7 @@ class Backbone(nn.Module):
         self.d5 = ConvBNAct(w * 8, w * 16, 3, 2)     # /32  -> C5
         self.s5 = nn.Sequential(*[ResBlock(w * 16) for _ in range(cfg.n5)])
         self.out_c2 = w * 2
+        self.out_c3 = w * 4
         self.out_c5 = w * 16
 
     def forward(self, x):
@@ -245,6 +271,7 @@ class JieqiNet(nn.Module):
 
         # ---- 几何头（[CLS] token + transformer）----
         self.geo_proj = ConvBNAct(self.backbone.out_c5, cfg.geo_dim, 1, 1)
+        self.geo_pool = cfg.geo_pool
         self.geo_cls = nn.Parameter(torch.zeros(1, 1, cfg.geo_dim))
         self.geo_blocks = nn.ModuleList(
             [Block(cfg.geo_dim, cfg.geo_heads, 2.0, cfg.drop) for _ in range(cfg.geo_blocks)])
@@ -275,8 +302,14 @@ class JieqiNet(nn.Module):
         self.cell_norm = nn.LayerNorm(d)
         self.cell_head = nn.Linear(d, NCLS)
 
-        # ---- 棋盘外目标头（CenterNet 风格，stride 4，深度可分离，单通道）----
-        oc = self.backbone.out_c2
+        # ---- 棋盘外目标头（CenterNet 风格，深度可分离，单通道）----
+        # obj_stride=4 用 C2（/4），=8 用 C3（/8）：步长由「读哪一层特征」决定，
+        # 不要再额外下采样（否则会变成 stride 16，被吃子只有 2~3 个像素，峰太钝）。
+        # 它只判「有没有子」，/8 的 80x80 热力图完全够用，算力还降到 1/4。
+        if cfg.obj_stride == 8:
+            oc = self.backbone.out_c3
+        else:
+            oc = self.backbone.out_c2
         self.obj_stem = nn.Sequential(
             DWConv(oc, cfg.obj_dim, 3, 1),
             DWConv(cfg.obj_dim, cfg.obj_dim, 3, 1),
@@ -287,6 +320,33 @@ class JieqiNet(nn.Module):
         nn.init.zeros_(self.obj_off.weight)
         nn.init.zeros_(self.obj_off.bias)
 
+        # ---- 常量全部注册成 buffer：forward 里不再出现 arange/linspace/sin/cos ----
+        # （导出后 ONNX 里就没有 Range/Sin/Cos/Constant 那一串节点了）
+        S = cfg.cell_win
+        N = NCELL * S * S
+        self.register_buffer("buf_u",
+                             torch.linspace(-0.5, 0.5, S) * cfg.cell_span, persistent=False)
+        self.register_buffer("buf_rows", torch.arange(ROWS, dtype=torch.float32),
+                             persistent=False)
+        self.register_buffer("buf_cols", torch.arange(COLS, dtype=torch.float32),
+                             persistent=False)
+        # 90 个格子各自的 (row, col)（行优先），用来算格心
+        self.register_buffer("buf_cell_col", torch.arange(COLS).repeat(ROWS),
+                             persistent=False)
+        self.register_buffer("buf_cell_row", torch.arange(ROWS).repeat_interleave(COLS),
+                             persistent=False)
+        self.register_buffer("buf_cell_of_n",
+                             torch.arange(NCELL).repeat_interleave(S * S), persistent=False)
+        self.register_buffer("buf_i_of_n",
+                             torch.arange(S).repeat_interleave(S).repeat(NCELL),
+                             persistent=False)
+        self.register_buffer("buf_j_of_n", torch.arange(S).repeat(NCELL * S),
+                             persistent=False)
+        gh, gw = _feat_size(cfg.input_size, 32)
+        self.register_buffer("buf_pe_geo",
+                             sincos_2d(gh // cfg.geo_pool, gw // cfg.geo_pool, cfg.geo_dim),
+                             persistent=False)
+
     # 让 lattice 一开始就输出数据集均值附近，收敛快
     def _init_geo_head(self):
         last = self.geo_head[-1]
@@ -296,43 +356,71 @@ class JieqiNet(nn.Module):
             last.bias.copy_(torch.log(prior / (1 - prior)))
 
     # ------------------------------------------------------------------
-    def cell_grid(self, lattice):
-        """由 lattice 生成格子采样网格（grid_sample 用的归一化坐标）。
+    # 采样点：由 lattice 算出 90 个格子窗口的采样坐标（**非** grid_sample）
+    #
+    # 为什么不用 F.grid_sample（这是 profile 后的决定，不是洁癖）：
+    #   * ORT 的 GridSample 内核要求 NHWC，前后各插一次 layout 转换；实测
+    #     GridSample 3.3 ms + ReorderInput/Output 5.1 ms ≈ 整帧的 30%；
+    #   * 导出的图里会多出一堆 Shape/Reshape/Transpose/Constant；
+    #   * 采样点只有 90*16*16=23040 个，自己写双线性就是 4 次 gather + 加权和，
+    #     全是 ORT 最擅长的算子。
+    #
+    # 所有常量都在 __init__ 里注册成 buffer，forward 里不再出现 Range/Sin/Cos。
+    # ------------------------------------------------------------------
+    def cell_points(self, lattice):
+        """返回采样点在**特征图归一化坐标**下的 (px, py)，各 [B, N]，N=90*S*S。
 
-        lattice: [B,4] = (x1,y1,x2,y2)，归一化到 [0,1]（letterbox 画布）。
-
-        注意：align_corners=False 时，归一化坐标 n 对应的像素位置是
-        (n+1)*W/2-0.5，所以图像归一化坐标 p∈[0,1] 映射到特征图就是 n = 2p-1，
-        与特征图尺寸无关 —— 这也是这里不需要任何 padding 换算的原因。
-
-        为了满足 grid_sample「grid 的 batch 必须等于输入的 batch」，
-        把 90 个格子折进 grid 的**高度**维：行索引 R = cell*S + i。
-        于是输出是 [B, C, NCELL*S, S]，再 reshape 回 90 个窗口。
+        坐标是图像归一化 [0,1]，与特征图尺寸无关：align_corners=False 时，
+        图像归一化坐标 p 直接对应特征图像素 p*W_feat-0.5。
         """
         B = lattice.shape[0]
-        cfg = self.cfg
-        dev = lattice.device
         dt = lattice.dtype
         x1, y1, x2, y2 = lattice[:, 0], lattice[:, 1], lattice[:, 2], lattice[:, 3]
         cw = (x2 - x1) / (COLS - 1)
         ch = (y2 - y1) / (ROWS - 1)
 
-        rows = torch.arange(ROWS, device=dev, dtype=dt)
-        cols = torch.arange(COLS, device=dev, dtype=dt)
-        cxs = x1[:, None] + cw[:, None] * cols.repeat(ROWS)[None]          # [B,90]
-        cys = y1[:, None] + ch[:, None] * rows.repeat_interleave(COLS)[None]
+        cxs = x1[:, None] + cw[:, None] * self.buf_cell_col[None]    # [B,90]
+        cys = y1[:, None] + ch[:, None] * self.buf_cell_row[None]
+        cx_n = cxs[:, self.buf_cell_of_n]                            # [B,N]
+        cy_n = cys[:, self.buf_cell_of_n]
+        px = cx_n + self.buf_u[self.buf_i_of_n][None] * cw[:, None]
+        py = cy_n + self.buf_u[self.buf_j_of_n][None] * ch[:, None]
+        return px, py
 
-        S = cfg.cell_win
-        u = torch.linspace(-0.5, 0.5, S, device=dev, dtype=dt) * cfg.cell_span
-        cell_of_r = torch.arange(NCELL, device=dev).repeat_interleave(S)   # [90*S]
-        i_of_r = torch.arange(S, device=dev).repeat(NCELL)                 # [90*S]
+    @staticmethod
+    def bilinear(fmap, px, py, size):
+        """显式双线性采样（等价 grid_sample(mode=bilinear, padding=border)）。
 
-        cx_r = cxs[:, cell_of_r]                                           # [B,90*S]
-        cy_r = cys[:, cell_of_r]
-        gx = (cx_r + (u[i_of_r].unsqueeze(0) * cw.unsqueeze(1))) * 2.0 - 1.0   # [B,90*S]
-        gx = gx.unsqueeze(-1).expand(-1, -1, S)
-        gy = (cy_r.unsqueeze(-1) + (u.unsqueeze(0) * ch.view(B, 1, 1))) * 2.0 - 1.0
-        return torch.stack([gx, gy], dim=-1).contiguous()                  # [B,90*S,S,2]
+        fmap: [B,C,H,W]；px,py: [B,N] ∈ [0,1]；返回 [B,C,N]。
+        """
+        H, W = size
+        fx = (px * W - 0.5).clamp(0.0, W - 1.0)
+        fy = (py * H - 0.5).clamp(0.0, H - 1.0)
+        x0 = torch.floor(fx)
+        y0 = torch.floor(fy)
+        x1 = (x0 + 1.0).clamp(0.0, W - 1.0)
+        y1 = (y0 + 1.0).clamp(0.0, H - 1.0)
+        wx = fx - x0
+        wy = fy - y0
+        x0 = x0.to(torch.int64)
+        x1 = x1.to(torch.int64)
+        y0 = y0.to(torch.int64)
+        y1 = y1.to(torch.int64)
+
+        B, C = fmap.shape[0], fmap.shape[1]
+        flat = fmap.reshape(B, C, H * W)
+        idx_shape = (B, C, -1)
+
+        def gat(yy, xx):
+            return torch.gather(flat, 2, (yy * W + xx).unsqueeze(1).expand(idx_shape))
+
+        g00, g01 = gat(y0, x0), gat(y0, x1)
+        g10, g11 = gat(y1, x0), gat(y1, x1)
+        w00 = ((1.0 - wy) * (1.0 - wx)).unsqueeze(1)
+        w01 = ((1.0 - wy) * wx).unsqueeze(1)
+        w10 = (wy * (1.0 - wx)).unsqueeze(1)
+        w11 = (wy * wx).unsqueeze(1)
+        return g00 * w00 + g01 * w01 + g10 * w10 + g11 * w11
 
     # ------------------------------------------------------------------
     def forward(self, x):
@@ -341,10 +429,10 @@ class JieqiNet(nn.Module):
 
         # ---------------- 几何 ----------------
         g = self.geo_proj(c5)
-        h, w = g.shape[-2:]
+        if self.geo_pool > 1:
+            g = F.avg_pool2d(g, self.geo_pool)
         tok = g.flatten(2).transpose(1, 2)                              # [B,h*w,D]
-        pe = sincos_2d(h, w, self.cfg.geo_dim).to(device=tok.device, dtype=tok.dtype)
-        tok = tok + pe.unsqueeze(0)
+        tok = tok + self.buf_pe_geo.unsqueeze(0)
         tok = torch.cat([self.geo_cls.expand(B, -1, -1).to(tok.dtype), tok], dim=1)
         for blk in self.geo_blocks:
             tok = blk(tok)
@@ -352,14 +440,17 @@ class JieqiNet(nn.Module):
         lattice = torch.sigmoid(self.geo_head(gcls))
 
         # ---------------- 格子 ----------------
-        grid = self.cell_grid(lattice)                                  # [B,90*S,S,2]
-        win = F.grid_sample(c2, grid, mode="bilinear", padding_mode="border",
-                            align_corners=False)                        # [B,C,90*S,S]
-        Bc, Cc, RS, S = win.shape
-        win = win.view(Bc, Cc, NCELL, S, S).permute(0, 2, 1, 3, 4) \
-                 .reshape(Bc * NCELL, Cc, S, S).contiguous()
+        size = (c2.shape[-2], c2.shape[-1])
+        px, py = self.cell_points(lattice)                              # [B,N]
+        win = self.bilinear(c2, px, py, size)                           # [B,C,N]
+        N = win.shape[-1]
+        S = self.cfg.cell_win
+        win = win.view(B, -1, NCELL, S, S).permute(0, 2, 1, 3, 4) \
+                 .reshape(B * NCELL, -1, S, S).contiguous()
         f = self.cell_enc(win)
-        f = F.adaptive_avg_pool2d(f, self.cfg.cell_pool)
+        # cell_enc 两次 stride2 已经把 S=16 变成 4x4，与 cell_pool 一致，
+        # 所以这里**不需要** adaptive_avg_pool2d —— 它原本就是个 no-op，
+        # 却会在 ONNX 里生成 Shape/Equal/Where/ConstantOfShape/Slice/Tile 一大串。
         t = self.cell_fc(f).view(B, NCELL, -1)                          # [B,90,d]
         pos = (self.cell_x
                + self.cell_row.repeat_interleave(COLS, 0)
@@ -372,7 +463,7 @@ class JieqiNet(nn.Module):
         cell_logits = self.cell_head(self.cell_norm(t[:, 1:]))           # [B,90,18]
 
         # ---------------- 棋盘外目标 ----------------
-        o = self.obj_stem(c2)
+        o = self.obj_stem(c2 if self.cfg.obj_stride == 4 else c3)
         obj_heat = torch.sigmoid(self.obj_heat(o))
         obj_off = self.obj_off(o)
 
