@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-jq_main.py —— 揭棋 · 皮卡鱼实时分析器（主程序）
+jq_main.py —— 揭棋（主程序）
 
 功能：
-  * 用 YOLO 识别天天象棋揭棋画面（棋盘框 + 棋子框）
-  * 自动排除棋盘外的被吃子、自动纠正暗子的红/黑颜色混淆
+  * 识别天天象棋揭棋画面（后端按 ONNX 的 arch 自动选：JieqiLatticeNet 结构化网格
+    模型 / YOLOv5 通用检测），自动排除棋盘外的被吃子、自动纠正暗子的红/黑颜色混淆
+  * 同一局内累计「被吃掉的明子」，用它收紧暗子池的上下界（被吃的车不会"复活"）
   * 生成皮卡鱼揭棋引擎所需的 5 段 FEN（含暗子池）
   * 实时调用 pikafish-bmi2.exe 分析，画箭头 + 中文着法
-  * 弹窗式局面编辑器（含暗子池微调与合法性校验）
+  * 暗子池快捷调整栏（带上下界与 ▲▼）+ 弹窗式局面编辑器
   * 窗口在后台时，一次点击即可操作棋盘（WM_MOUSEACTIVATE 处理）
 
 用法：
@@ -37,7 +38,7 @@ from jq_board import (
     move_to_chinese, move_to_uci, uci_to_move, default_pool_guess, pool_from_bounds,
     pool_to_string, pool_sums, KIND_NAMES, KIND_NAMES_BLACK, kind_name,
     align_pool, effective_kind, side_from_moved_colors, side_from_start,
-    repair_stray_apparition,
+    repair_stray_apparition, pool_bounds, POOL_ORDER, FULL_SET,
 )
 from jq_engine import EngineHandler, score_text, wdl_text, sanitize_fen, JIEQI_START_FEN
 from jq_detect import detect_raw, parse_board, get_session, CLASS_NAMES, CLS_INFO, \
@@ -193,7 +194,7 @@ class MainWindow(QMainWindow):
     def __init__(self, settings=None):
         super().__init__()
         self.settings = settings or load_settings()
-        self.setWindowTitle("揭棋 · 天天象棋连线")
+        self.setWindowTitle("揭棋 · 天天连线")
         self.resize(1280, 820)
 
         get_session(MODEL_PATH)   # 主线程里先建好会话，避免多线程竞争
@@ -224,8 +225,11 @@ class MainWindow(QMainWindow):
         self._bad_frames = 0
         self._good_streak = 0
         self._last_det_board = None
-        self._last_captured = {"r": {}, "b": {}}
-        self._last_captured_unknown = {"r": 0, "b": 0}
+        # 本局已经吃掉的子（累计，用于收紧暗子池的上下界）：
+        #   captured[color][kind] = 被吃掉的**明子**个数（兵种可靠）
+        #   captured_unknown[color] = 被吃掉的暗子个数（兵种未知，只记数量）
+        self.captured = {"r": {}, "b": {}}
+        self.captured_unknown = {"r": 0, "b": 0}
         self._auto_pool = True
         # 用户是否在编辑局面弹窗里手动调过暗子池 → 手动值优先，不再自动推算
         self._pool_manual = False
@@ -356,6 +360,10 @@ class MainWindow(QMainWindow):
         self.pool_bar = DarkPoolBar()
         self.pool_bar.changed.connect(self._on_pool_bar_changed)
         pc.addWidget(self.pool_bar)
+        self.lb_captured = QLabel("已被吃：无")
+        self.lb_captured.setObjectName("Sub")
+        self.lb_captured.setContentsMargins(10, 0, 10, 6)
+        pc.addWidget(self.lb_captured)
         rv.addWidget(pool_card)
 
         # 引擎分析
@@ -698,8 +706,6 @@ class MainWindow(QMainWindow):
         if key != self._last_key:
             self._last_key = key
             self._last_det_board = det.board.copy()
-            self._last_captured, self._last_captured_unknown = tray_captured_counts(
-                det.tray, det.board)
             self._good_streak = 1
             return
         self._good_streak += 1
@@ -771,18 +777,61 @@ class MainWindow(QMainWindow):
             self._pending_since = now
             self.status_msg = "局面变化存疑，观察中（2.5s）：" + "；".join(reason)
 
+    # ------------------------------------------------------------------
+    # 被吃掉的子（本局累计）
+    # ------------------------------------------------------------------
+    def _reset_captured(self):
+        """清空累计。新连一局 / 识别到"走了不止一步"的突变 / 手动改局面时调用。
+
+        用户口径：同一局内吃掉的明子要一直记着参与约束；一旦局面跳得太多、
+        当成新开一局，就不再沿用旧账。
+        """
+        self.captured = {"r": {}, "b": {}}
+        self.captured_unknown = {"r": 0, "b": 0}
+
+    def _note_captures(self, old_board, trans):
+        """把这一步里被吃掉的子记进累计表。
+
+        `trans["replaced"]` 是「旧局面有子、新局面换成了别的子」的格子，也就是
+        吃子发生的地方；旧局面上那一格的内容就是被吃掉的子。**明子记兵种，暗子只记数量**
+        —— 暗子被吃时兵种是看不见的隐藏信息，不能猜。
+        """
+        for sq in trans.get("replaced", []):
+            p = old_board.get(*sq)
+            if p is None:
+                continue
+            color = getattr(p, "color", None)
+            if color not in ("r", "b"):
+                continue
+            if p.dark or p.kind is None:
+                self.captured_unknown[color] += 1
+            else:
+                d = self.captured.setdefault(color, {})
+                d[p.kind] = d.get(p.kind, 0) + 1
+
+    def captured_summary(self):
+        """给界面/自检用的一句话：「红 车1 炮1 · 黑 卒2（暗子 1）」"""
+        parts = []
+        for color, label in (("r", "红"), ("b", "黑")):
+            items = []
+            for k in POOL_ORDER:
+                n = self.captured.get(color, {}).get(k, 0)
+                if n:
+                    items.append(f"{kind_name(k, color)}{n}")
+            if self.captured_unknown.get(color):
+                items.append(f"暗子{self.captured_unknown[color]}")
+            if items:
+                parts.append(label + " " + " ".join(items))
+        return " · ".join(parts) if parts else "无"
+
     def _pool_from_detection(self, det):
         """按这次识别结果推算暗子池（最坏情况口径，不猜隐藏信息）。
 
-        被吃子区里读数"看得清"的（明子身份的框）当作已确认；
-        按不确定身份框的数量，作为「被吃掉但看不清兵种」的差额交给 pool_from_bounds。
+        「被吃掉的明子」用**本局累计**的账（`self.captured`），而不是这一帧
+        棋盘外那一列的读数 —— 累计账来自盘面变化，是确凿的；棋盘外那列的兵种
+        读数本来就不可靠，宁可不收紧也不能收紧错。
         """
-        known, unknown = tray_captured_counts(det.tray, det.board,
-                                              min_score=_jqd.TRAY_MIN_SCORE)
-        n_unknown = {"r": 0, "b": 0}
-        for color in ("r", "b"):
-            n_unknown[color] = int(unknown.get(color, 0))
-        pool, _bounds = pool_from_bounds(det.board, known, n_unknown)
+        pool, _bounds = pool_from_bounds(det.board, self.captured, self.captured_unknown)
         return pool
 
     def _apply_transition(self, det, trans, new_pool, force=False):
@@ -790,6 +839,12 @@ class MainWindow(QMainWindow):
         n_moved = len(trans["vacated"])
         reveal = bool(trans["moved_dark"]) or bool(trans["revealed"])
         capture = bool(trans["replaced"])
+        if force:
+            # 局面跳得太多、解释不了 → 按用户口径当成"新开一局"，旧账不再沿用
+            self._reset_captured()
+        if capture:
+            # 记在**旧局面**上：被吃的那一格旧内容就是受害者
+            self._note_captures(self.position.board, trans)
         side = self.position.side
         if force:
             fullmove = self.position.fullmove
@@ -838,6 +893,8 @@ class MainWindow(QMainWindow):
                 side = self.position.side
             else:
                 side = side_from_start(board)
+        # 全新局面同步 → 之前那一局的被吃子账不再适用
+        self._reset_captured()
         pos = Position(board.copy(), side,
                        pool if pool else default_pool_guess(board))
         pos.rule40 = 0
@@ -868,10 +925,17 @@ class MainWindow(QMainWindow):
             self._engine_go()
 
     def _refresh_pool_bar(self):
-        """按当前盘面重算暗子池的上下界，并把现有池子夹进去对齐。"""
+        """按当前盘面 + 本局已吃掉的明子，重算暗子池上下界，并把现有池子夹进去对齐。"""
         try:
             self.pool_bar.set_pool(self.position.pool, self.position.board,
-                                   self._last_captured, self._last_captured_unknown)
+                                   self.captured, self.captured_unknown)
+            base = "已被吃：" + self.captured_summary()
+            if hasattr(self, "lb_captured"):
+                self.lb_captured.setText(base)
+                self.lb_captured.setToolTip(
+                    "本局累计被吃掉的子。明子记兵种（上面栏目的上界已经把它扣掉了）；\n"
+                    "暗子被吃时兵种看不见，所以只记数量，不参与兵种上下界。\n"
+                    "局面跳太多、当成新开一局时会清零。")
         except Exception:
             pass
 
@@ -991,6 +1055,7 @@ class MainWindow(QMainWindow):
         self._auto_pool = True
         self._pool_manual = False
         self._side_user_set = False
+        self._reset_captured()          # 新局：被吃子账清零
         self.board.last_move = None
         self.board.selected = None
         self.board.hint_moves = []
@@ -1017,7 +1082,7 @@ class MainWindow(QMainWindow):
             self._after_position_change()
 
     def open_editor(self):
-        dlg = PositionEditorDialog(self.position, self, captured=self._last_captured,
+        dlg = PositionEditorDialog(self.position, self, captured=self.captured,
                                    flip=self.board.flip)
         if self.detection:
             dlg.set_detected(self.detection.board)
@@ -1027,6 +1092,7 @@ class MainWindow(QMainWindow):
             self._pool_manual = True
             self._side_user_set = True
             self.synced = False
+            self._reset_captured()      # 手动摆的局面，旧账不再适用
             self.board.selected = None
             self.board.hint_moves = []
             self.status_msg = "已手动编辑局面（暗子池不再自动推算）"
@@ -1053,6 +1119,7 @@ class MainWindow(QMainWindow):
         self._auto_pool = False
         self._pool_manual = True
         self._side_user_set = True
+        self._reset_captured()          # 贴进来的局面，旧账不再适用
         self.status_msg = "已从剪贴板载入局面"
         self._after_position_change()
 
@@ -1161,6 +1228,9 @@ HELP_TEXT = """\
      优先动最小子力（相满了就兵），所以池子之和恒等于盘面暗子数 —— 引擎硬要求。
    • 一调就立刻生效（FEN 更新），并标记为"手动"，之后识别的自动推算不再覆盖它；
      想交回自动，重新连线或改一次局面即可。
+   • 栏底那行「已被吃：红 … · 黑 …」是**本局累计**的被吃子账：
+     吃掉的明子记兵种（上界已经扣掉它，不会"复活"），吃掉的暗子兵种看不见、
+     只记数量。同一局内一直累计；局面跳太多、当成新开一局时清零。
 
 7. 识别后端
    快捷调整栏标题右边会显示当前用的是哪个模型：
@@ -1413,9 +1483,13 @@ def selftest(test_dir=None):
         out.write(f"  → 不符项 {bad}\n")
 
         # 端到端：生成 FEN → 引擎分析
-        known, unknown = tray_captured_counts(det.tray, det.board,
-                                              min_score=_jqd.TRAY_MIN_SCORE)
-        pool = default_pool_guess(det.board, known)
+        # 这是单帧静态自检（没有对局历史），所以"被吃掉的明子"账是空的；
+        # 实盘里那份账由 _sync_state_machine 逐帧累计。
+        pool = default_pool_guess(det.board, {})
+        _p, _lo, _hi = pool_bounds(det.board, {}, {})
+        out.write("  被吃掉的明子：无一局历史（静态自检），上下界只由盘面明子决定\n")
+        out.write("  暗子池上下界：" + "  ".join(
+            f"{kind_name(k, 'r')}{_lo['r'][k]}-{_hi['r'][k]}" for k in POOL_ORDER) + "\n")
         pos = Position(det.board, "w", pool)
         out.write(f"  FEN: {pos.fen()}\n")
         out.write(f"  校验: {pos.validate() or '通过'}\n")
