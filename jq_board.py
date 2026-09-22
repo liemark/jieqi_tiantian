@@ -512,6 +512,89 @@ def pool_from_bounds(board, captured=None, unknown_captured=None):
     return pool, bounds
 
 
+# 手动调池时的默认子力排序（从大到小）与「找平顺序」（反过来）。
+# 用户要"积极一点"就把某个大子调高，要"稳妥一点"就调低；数量守恒由一个
+# 自动找平的动作补上：**优先动最小子力**，相满了就兵。
+POOL_VALUE_ORDER = ("R", "C", "N", "A", "P", "B")   # 车 > 炮 > 马 > 士 > 兵 > 相
+POOL_COMPENSATE_ORDER = tuple(reversed(POOL_VALUE_ORDER))  # 相 -> 兵 -> 士 -> 马 -> 炮 -> 车
+
+
+def pool_bounds(board, captured=None, unknown_captured=None):
+    """算出一方暗子池里每个兵种的**可行上下界**（供手动调池用）。
+
+        hi[k] = 全套 − 盘面已翻开 − 已确认被吃（看不懂兵种的不算）
+        lo[k] = max(0, 该方暗子总数 − 其它兵种上界之和)
+
+    下界是这么来的：池内数量之和**必须**等于盘面暗子数（引擎硬要求），
+    所以 k 至少得是「总数 − 其它所有兵种最多能占的份额」。
+    返回 (pool, lo, hi)，pool 是默认口径下的一个合法取值。
+
+    可保证：sum(hi) >= 暗子总数（因为 hi 只减了"已翻开"），所以这个盒子非空。
+    """
+    captured = captured or {"r": {}, "b": {}}
+    unknown_captured = unknown_captured or {"r": 0, "b": 0}
+    pool, hi = pool_from_bounds(board, captured, unknown_captured)
+    lo = {"r": {}, "b": {}}
+    for color in ("r", "b"):
+        total = board.hidden_count(color)
+        others = sum(hi[color].get(k, 0) for k in FULL_SET if k != "K")
+        for k in FULL_SET:
+            if k == "K":
+                continue
+            h = max(0, int(hi[color].get(k, 0)))
+            l = max(0, total - (others - h))
+            lo[color][k] = min(l, h)
+            hi[color][k] = h
+    return pool, lo, hi
+
+
+def fit_pool(pool, color, total, lo, hi, protect=None):
+    """把一方的池子夹进 [lo,hi] 并把总和调整为 total（优先动最小子力）。
+
+    protect：不动这个兵种（用户刚刚手动改过的那个）。
+    返回 (pool, leftover)；就地把 pool 改好。
+    """
+    d = pool.setdefault(color, {})
+    ks = [k for k in FULL_SET if k != "K"]
+    for k in ks:
+        d[k] = int(max(lo[color].get(k, 0), min(hi[color].get(k, 0), int(d.get(k, 0)))))
+    need = int(total) - sum(d[k] for k in ks)          # >0 要补，<0 要扣
+    order = [k for k in POOL_COMPENSATE_ORDER if k != protect]
+    for k in ks:                                        # 兜底：确保每个兵种都在扫描表里
+        if k not in order:
+            order.append(k)
+    guard = 0
+    while need != 0 and guard < 400:
+        guard += 1
+        moved = False
+        for k in order:
+            if need > 0 and d[k] < hi[color].get(k, 0):
+                d[k] += 1
+                need -= 1
+                moved = True
+            elif need < 0 and d[k] > lo[color].get(k, 0):
+                d[k] -= 1
+                need += 1
+                moved = True
+            if need == 0:
+                break
+        if not moved:
+            break
+    return d, need
+
+
+def rebalance_pool(pool, color, kind, new_value, lo, hi, total):
+    """用户手动改了一个兵种的数量：夹进上下界，再把总数找平。
+
+    找平顺序就是 POOL_COMPENSATE_ORDER（相 -> 兵 -> 士 -> 马 -> 炮 -> 车）：
+    优先动最小子力，相满了就兵；刚改过的那一个绝不被动。
+    返回 (pool, leftover)，正常盒子下 leftover 为 0。
+    """
+    d = pool.setdefault(color, {})
+    d[kind] = int(max(lo[color].get(kind, 0), min(hi[color].get(kind, 0), int(new_value))))
+    return fit_pool(pool, color, total, lo, hi, protect=kind)
+
+
 def default_pool_guess_legacy(board, captured=None):
     """旧口径：把被吃子按兵种直接扣减（信息上偏乐观，保留作对照/回退）。"""
     pool = empty_pool()

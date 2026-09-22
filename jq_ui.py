@@ -25,6 +25,7 @@ from jq_board import (
     ROWS, COLS, Board, Piece, Position, FULL_SET, POOL_ORDER,
     RED_DARK_SQUARES, BLACK_DARK_SQUARES, START_LAYOUT,
     default_pool_guess, pool_sums, kind_name, move_to_chinese, move_to_uci,
+    POOL_VALUE_ORDER, pool_bounds, rebalance_pool, fit_pool,
 )
 from jq_paths import find_asset, user_dir, resource_dir
 
@@ -595,6 +596,181 @@ class PiecePalette(QWidget):
     def _sync_checks(self):
         for k, b in self.buttons.items():
             b.setChecked(k == self.current)
+
+
+# --------------------------------------------------------------------------
+# 暗子数量快捷调整栏（替代原来的「识别预览」卡片）
+# --------------------------------------------------------------------------
+
+class DarkPoolBar(QFrame):
+    """暗子数量快捷调整栏。
+
+    每方一行，6 个兵种各一个步进框，**上下界直接锁死在 QSpinBox 上**（下面还写着
+    `下-上` 让用户看得见）。改其中任何一个，其余按「子力从小到大」自动找平：
+    相 → 兵 → 士 → 马 → 炮 → 车，相满了就轮到兵，以此类推，
+    保证「池内数量之和 == 盘面暗子数」这条引擎硬要求永远成立。
+
+    changed 信号：用户真的改过之后发一次（程序化刷新时不发），主窗口据此
+    把池子标记成"手动"，不再被自动推算覆盖。
+    """
+
+    changed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.pool = {"r": {}, "b": {}}
+        self.lo = {"r": {}, "b": {}}
+        self.hi = {"r": {}, "b": {}}
+        self.total = {"r": 0, "b": 0}
+        self._busy = False
+        self._spins = {"r": {}, "b": {}}
+        self._rng = {"r": {}, "b": {}}
+        self._up = {"r": {}, "b": {}}
+        self._dn = {"r": {}, "b": {}}
+
+        grid = QGridLayout(self)
+        grid.setContentsMargins(8, 6, 8, 8)
+        grid.setHorizontalSpacing(2)
+        grid.setVerticalSpacing(2)
+
+        for j, k in enumerate(POOL_VALUE_ORDER):
+            lb = QLabel("车炮马士兵相"[j])
+            lb.setObjectName("Sub")
+            lb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            grid.addWidget(lb, 0, j + 1)
+
+        for i, color in enumerate(("r", "b")):
+            name = QLabel("红" if color == "r" else "黑")
+            name.setObjectName("Sub")
+            grid.addWidget(name, i + 1, 0)
+            for j, k in enumerate(POOL_VALUE_ORDER):
+                grid.addWidget(self._make_cell(color, k), i + 1, j + 1)
+        self.setToolTip(
+            "暗子池快捷调整：\n"
+            "· 格子里是「你方暗子里还可能有几个该兵种」，下面的小字是它的可行上下界；\n"
+            "· 右侧 ▲▼ 快速加减；到上下界会自动变灰（越界不了）；\n"
+            "· 调高某个大子 = 假设暗子里有它（积极）；调低 = 不指望它（稳妥）；\n"
+            "· 多退少补自动找平，顺序 相→兵→士→马→炮→车（优先动最小子力），\n"
+            "  所以池子之和恒等于盘面暗子数，且不会越界。")
+
+    def _make_cell(self, color, kind):
+        """一个兵种的格子：输入框 + 右侧小上下箭头 + 下面的上下界小字。"""
+        box = QWidget()
+        v = QVBoxLayout(box)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+        h = QHBoxLayout()
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(1)
+
+        sp = QSpinBox()
+        sp.setRange(0, FULL_SET[kind])
+        sp.setFixedWidth(30)
+        sp.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sp.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        sp.setStyleSheet("QSpinBox{padding:1px 2px;border-radius:5px;}")
+        sp.valueChanged.connect(lambda v_, c=color, kk=kind: self._on_value(c, kk, v_))
+        h.addWidget(sp)
+
+        arrows = QWidget()
+        av = QVBoxLayout(arrows)
+        av.setContentsMargins(0, 0, 0, 0)
+        av.setSpacing(0)
+        up = QToolButton()
+        dn = QToolButton()
+        for b, txt in ((up, "▲"), (dn, "▼")):
+            b.setText(txt)
+            b.setFixedSize(14, 11)
+            b.setAutoRepeat(True)
+            b.setAutoRepeatDelay(400)
+            b.setAutoRepeatInterval(70)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet(
+                "QToolButton{border:none;background:transparent;color:#8b93a3;"
+                "font-size:7px;padding:0;margin:0;}"
+                "QToolButton:hover{color:#e6e9ef;}"
+                "QToolButton:disabled{color:#3a4050;}")
+        up.clicked.connect(lambda: sp.setValue(sp.value() + 1))
+        dn.clicked.connect(lambda: sp.setValue(sp.value() - 1))
+        av.addWidget(up)
+        av.addWidget(dn)
+        h.addWidget(arrows)
+        v.addLayout(h)
+
+        rg = QLabel("-")
+        rg.setObjectName("Sub")
+        rg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        rg.setStyleSheet("font-size:10px;")
+        v.addWidget(rg)
+
+        self._spins[color][kind] = sp
+        self._rng[color][kind] = rg
+        self._up[color][kind] = up
+        self._dn[color][kind] = dn
+        return box
+
+    # ------------------------------------------------------------------
+    def set_pool(self, pool, board, captured=None, unknown_captured=None):
+        """按当前盘面重算上下界，并把（可能被用户改过的）池子夹进去对齐。"""
+        _def, lo, hi = pool_bounds(board, captured, unknown_captured)
+        self.lo, self.hi = lo, hi
+        self.total = {c: board.hidden_count(c) for c in ("r", "b")}
+        src = pool or {}
+        for color in ("r", "b"):
+            d = {k: int(src.get(color, {}).get(k, 0)) for k in FULL_SET if k != "K"}
+            if not any(d.values()) and self.total[color]:
+                d = {k: _def[color].get(k, 0) for k in FULL_SET if k != "K"}
+            self.pool[color] = d
+            fit_pool(self.pool, color, self.total[color], self.lo, self.hi)
+        self._refresh()
+
+    def pool_snapshot(self):
+        return {c: dict(self.pool[c]) for c in ("r", "b")}
+
+    # ------------------------------------------------------------------
+    def _on_value(self, color, kind, v):
+        if self._busy:
+            return
+        if v == self.pool[color].get(kind, 0):
+            return
+        self._busy = True
+        try:
+            _p, leftover = rebalance_pool(self.pool, color, kind, v,
+                                          self.lo, self.hi, self.total[color])
+            if leftover:
+                self._refresh()          # 找不平就退回合法状态（理论上到不了）
+                return
+            self._refresh()
+        finally:
+            self._busy = False
+        self.changed.emit()
+
+    def _refresh(self):
+        busy = self._busy
+        self._busy = True
+        try:
+            for color in ("r", "b"):
+                for k in POOL_VALUE_ORDER:
+                    lo = int(self.lo[color].get(k, 0))
+                    hi = int(self.hi[color].get(k, 0))
+                    v = int(self.pool[color].get(k, 0))
+                    sp = self._spins[color][k]
+                    sp.setRange(lo, hi)
+                    sp.setValue(v)
+                    self._rng[color][k].setText(f"{lo}-{hi}")
+                    locked = (lo == hi)
+                    sp.setStyleSheet(
+                        "QSpinBox{padding:1px 2px;border-radius:5px;color:#6b7280;}"
+                        if locked else "QSpinBox{padding:1px 2px;border-radius:5px;}")
+                    # 到界就把对应箭头灰掉，一眼看出还能不能调
+                    self._up[color][k].setEnabled(v < hi)
+                    self._dn[color][k].setEnabled(v > lo)
+                    self._up[color][k].setToolTip(
+                        "已到上界" if v >= hi else f"调高（上限 {hi}）")
+                    self._dn[color][k].setToolTip(
+                        "已到下界" if v <= lo else f"调低（下限 {lo}）")
+        finally:
+            self._busy = busy
 
 
 # --------------------------------------------------------------------------

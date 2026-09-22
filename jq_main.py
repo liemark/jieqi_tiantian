@@ -25,7 +25,7 @@ import ctypes
 import numpy as np
 
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize
-from PyQt6.QtGui import QImage, QPixmap, QAction, QKeySequence, QGuiApplication
+from PyQt6.QtGui import QAction, QKeySequence, QGuiApplication
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout,
                              QVBoxLayout, QGridLayout, QLabel, QPushButton,
                              QFrame, QListWidget, QListWidgetItem, QSplitter,
@@ -48,7 +48,7 @@ import jq_detect as _jqd
 from jq_capture import WindowCapture, ScreenCapture
 from jq_paths import find_asset, resource_dir, user_dir, is_frozen
 from jq_ui import (THEME, STYLESHEET, BoardWidget, PositionEditorDialog,
-                   EngineSettingsDialog, load_settings, save_settings,
+                   EngineSettingsDialog, DarkPoolBar, load_settings, save_settings,
                    enable_one_click_activation, PIECES_DIR)
 
 ARROW_COLORS = ["#ff4d4f", "#4c9aff", "#34c759", "#ffb020", "#c586ff"]
@@ -214,7 +214,6 @@ class MainWindow(QMainWindow):
         self.capture = None
         self.worker = None
         self.detection = None
-        self.preview_img = None
         self.live_on = False
 
         # 连线同步状态机
@@ -334,31 +333,30 @@ class MainWindow(QMainWindow):
         cv.addLayout(row3)
         rv.addWidget(ctl)
 
-        # 识别预览
-        prev_card = QFrame()
-        prev_card.setObjectName("Card")
-        pv = QVBoxLayout(prev_card)
-        pv.setContentsMargins(10, 8, 10, 10)
-        pv.setSpacing(6)
-        ph = QHBoxLayout()
-        t = QLabel("识别预览")
+        # 暗子数量快捷调整栏（替代原来的「识别预览」）
+        pool_card = QFrame()
+        pool_card.setObjectName("Card")
+        pc = QVBoxLayout(pool_card)
+        pc.setContentsMargins(0, 8, 0, 0)
+        pc.setSpacing(4)
+        ch = QHBoxLayout()
+        ch.setContentsMargins(10, 0, 10, 0)
+        t = QLabel("暗子池快捷调整")
         t.setObjectName("Title")
-        ph.addWidget(t)
-        ph.addStretch(1)
+        ch.addWidget(t)
+        ch.addStretch(1)
         self.lb_model = QLabel("模型")
         self.lb_model.setObjectName("Sub")
         self.lb_model.setToolTip("当前识别后端（按 ONNX 元数据的 arch 字段自动选择）")
-        ph.addWidget(self.lb_model)
+        ch.addWidget(self.lb_model)
         self.lb_det = QLabel("—")
         self.lb_det.setObjectName("Sub")
-        ph.addWidget(self.lb_det)
-        pv.addLayout(ph)
-        self.lb_preview = QLabel("未连线")
-        self.lb_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lb_preview.setMinimumHeight(150)
-        self.lb_preview.setStyleSheet("background:#0f1116;border-radius:8px;color:#5b6270;")
-        pv.addWidget(self.lb_preview)
-        rv.addWidget(prev_card)
+        ch.addWidget(self.lb_det)
+        pc.addLayout(ch)
+        self.pool_bar = DarkPoolBar()
+        self.pool_bar.changed.connect(self._on_pool_bar_changed)
+        pc.addWidget(self.pool_bar)
+        rv.addWidget(pool_card)
 
         # 引擎分析
         eng_card = QFrame()
@@ -461,10 +459,6 @@ class MainWindow(QMainWindow):
         self.act_hint.setChecked(self.settings.get("show_hints", True))
         self.act_hint.triggered.connect(self._on_hints)
         m_view.addAction(self.act_hint)
-        self.act_preview = QAction("识别预览", self, checkable=True)
-        self.act_preview.setChecked(True)
-        self.act_preview.triggered.connect(self._on_preview)
-        m_view.addAction(self.act_preview)
 
         m_help = mb.addMenu("帮助(&H)")
         a = QAction("使用说明", self)
@@ -646,9 +640,11 @@ class MainWindow(QMainWindow):
             if not cap.start():
                 return False, cap.error
             self.capture = cap
+        # preview=False：界面上的识别预览已经删掉了（那个位置换成了暗子池快捷调整栏），
+        # 每帧再画一张缩略图纯属白烧 CPU。
         self.worker = DetectWorker(self.capture, conf=self.settings.get("conf", 0.35),
                                    interval_ms=self.settings.get("interval_ms", 180),
-                                   preview=self.act_preview.isChecked())
+                                   preview=False)
         self.worker.result.connect(self.on_detection)
         self.worker.error.connect(lambda m: setattr(self, "status_msg", m))
         self.worker.start()
@@ -663,14 +659,10 @@ class MainWindow(QMainWindow):
             self.capture.stop()
             self.capture = None
         self.detection = None
-        self.preview_img = None
-        self.lb_preview.setText("未连线")
-        self.lb_preview.setPixmap(QPixmap())
 
     def on_detection(self, det, preview):
+        # preview 参数保留在信号签名里（DetectWorker 仍然会发），但界面上的预览已删除
         self.detection = det
-        if preview is not None and self.act_preview.isChecked():
-            self._show_preview(preview)
         # 视角自动跟随：画面里黑方在下（= 用户在执黑）时，把棋盘转 180°，与屏幕一致
         if det.ok and self.settings.get("auto_rotate", True):
             want = bool(det.rotated)
@@ -680,14 +672,14 @@ class MainWindow(QMainWindow):
                 self.board.update()
         self._sync_state_machine(det)
 
-    def _show_preview(self, bgr):
-        h, w = bgr.shape[:2]
-        self._prev_buf = np.ascontiguousarray(bgr)
-        img = QImage(self._prev_buf.data, w, h, 3 * w, QImage.Format.Format_BGR888)
-        pm = QPixmap.fromImage(img).scaledToWidth(
-            min(400, self.lb_preview.width() or 380), Qt.TransformationMode.SmoothTransformation)
-        self.lb_preview.setPixmap(pm)
-        self.lb_preview.setText("")
+    def _on_pool_bar_changed(self):
+        """用户在快捷栏里调了暗子数量：写回当前局面，并标记为手动（不再自动推算）。"""
+        self.position.pool = self.pool_bar.pool_snapshot()
+        self._auto_pool = False
+        self._pool_manual = True
+        self.fen_edit.setText(self.position.fen())
+        self.status_msg = "已手动调整暗子池：" + pool_to_string(self.position.pool)
+        self._refresh_status()
 
     def _sync_state_machine(self, det):
         """揭棋专用同步逻辑：
@@ -869,10 +861,19 @@ class MainWindow(QMainWindow):
     def _after_position_change(self, reset_analysis=True):
         self.board.set_position(self.position)
         self.fen_edit.setText(self.position.fen())
+        self._refresh_pool_bar()
         self._refresh_status()
         self._refresh_history()
         if self.analysis_on:
             self._engine_go()
+
+    def _refresh_pool_bar(self):
+        """按当前盘面重算暗子池的上下界，并把现有池子夹进去对齐。"""
+        try:
+            self.pool_bar.set_pool(self.position.pool, self.position.board,
+                                   self._last_captured, self._last_captured_unknown)
+        except Exception:
+            pass
 
     def _refresh_status(self):
         turn = "红方" if self.position.side == "w" else "黑方"
@@ -1101,10 +1102,6 @@ class MainWindow(QMainWindow):
             self.board.hint_moves = []
         self.board.update()
 
-    def _on_preview(self):
-        if self.worker:
-            self.worker.preview = self.act_preview.isChecked()
-
     def show_help(self):
         QMessageBox.information(self, "使用说明", HELP_TEXT)
 
@@ -1152,11 +1149,23 @@ HELP_TEXT = """\
    识别到 1 步时自动换执方；也可手动「换执方」。点棋盘选中棋子会显示可走点，
    双击右侧着法可试走。识别出错时可用「编辑局面」或强制走子修正。
 
-6. 识别后端
-   「识别预览」标题右边会显示当前用的是哪个模型：
-   • 「网格模型 jqnet.onnx」= JieqiLatticeNet，把棋盘当成 9x10 网格逐格分类：
-     走子提示白圈结构上不可能变成棋子；棋盘外的被吃子在预览里画成灰圈+叉，
-     表示"看到了但直接无视"。
+6. 暗子池快捷调整栏（右侧面板第一块）
+   两行（红/黑），每行 6 个兵种：车 炮 马 士 兵 相。
+   • 格子里是"你方暗子里还可能有几个该兵种"，下面小字是它的**可行上下界**；
+     上下界由盘面唯一确定（上界 = 全套 − 已翻开；下界 = 暗子总数 − 其它兵种上界之和），
+     步进框本身就把范围锁死了，不可能调出界。
+   • 每个框**右侧有小的 ▲▼**，点一下加减 1（按住会连续加减）；
+     到了上界 ▲ 变灰、到了下界 ▼ 变灰，一眼就知道还能不能调。
+   • 想**积极**一点（假设暗子里有大子）就把车/炮往上调；想**稳妥**一点就往下调。
+   • 数量自动找平：多退少补按「相 → 兵 → 士 → 马 → 炮 → 车」的顺序，
+     优先动最小子力（相满了就兵），所以池子之和恒等于盘面暗子数 —— 引擎硬要求。
+   • 一调就立刻生效（FEN 更新），并标记为"手动"，之后识别的自动推算不再覆盖它；
+     想交回自动，重新连线或改一次局面即可。
+
+7. 识别后端
+   快捷调整栏标题右边会显示当前用的是哪个模型：
+   • 「网格模型 jqnet.onnx」= JieqiLatticeNet，把棋盘当成 9x10 网格逐格分类，
+     走子提示白圈结构上不可能变成棋子，棋盘外的被吃子直接忽视。
    • 「检测模型 best.onnx」= YOLOv5 风格通用检测（旧后端，保留兼容）。
    把想用的 onnx 放到 exe 旁边同名即可切换，不用改任何设置。
 """
