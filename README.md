@@ -1,4 +1,5 @@
 # jieqi_tiantian
+![image](https://github.com/liemark/jieqi_tiantian/blob/main/readme.png)
 ~~YOLO 模型~~棋子识别模型由生成的数据集训练，简单而言先识别棋盘格，再对棋盘格进行分类任务，不需要 yolo 的通用检测流程  
 其它的 UI 和 Readme 都是 DSH 写的  
 ~~用 YOLO~~识别「天天象棋」的揭棋画面，把局面转成皮卡鱼揭棋引擎
